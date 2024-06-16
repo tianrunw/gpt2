@@ -1,6 +1,9 @@
+import math
 from dataclasses import dataclass
 
+import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -12,6 +15,48 @@ class GPT2Config:
     n_embd: int = 256
 
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        # k, q, v projections for all heads but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        # regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+        # not a bias but a mask, calling it bias here to follow OpenAI naming
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                1, 1, config.block_size, config.block_size
+            ),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+
+# aka feed forward
 class MLP(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
@@ -36,7 +81,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))  # aka feed forward
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
